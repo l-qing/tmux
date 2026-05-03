@@ -29,6 +29,55 @@
 static FILE	*log_file;
 static int	 log_level;
 
+/* Substrings loaded from TMUX_LOG_DROP (comma-separated) at first log call. */
+static char	**log_drop_subs;
+static size_t	  log_drop_n;
+
+/* Parse TMUX_LOG_DROP once; entries are comma-separated substrings. */
+static void
+log_init_drops(void)
+{
+	const char	*env;
+	char		*copy, *p, *tok;
+	size_t		 cap = 0;
+
+	env = getenv("TMUX_LOG_DROP");
+	if (env == NULL || *env == '\0')
+		return;
+	if ((copy = strdup(env)) == NULL)
+		return;
+	p = copy;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		if (*tok == '\0')
+			continue;
+		if (log_drop_n == cap) {
+			cap = (cap == 0) ? 16 : cap * 2;
+			log_drop_subs = xreallocarray(log_drop_subs, cap,
+			    sizeof *log_drop_subs);
+		}
+		log_drop_subs[log_drop_n++] = strdup(tok);
+	}
+	free(copy);
+}
+
+/* Return 1 if buf matches any entry in the drop list. */
+static int
+log_should_drop(const char *buf)
+{
+	static int	initialized;
+	size_t		i;
+
+	if (!initialized) {
+		initialized = 1;
+		log_init_drops();
+	}
+	for (i = 0; i < log_drop_n; i++) {
+		if (strstr(buf, log_drop_subs[i]) != NULL)
+			return (1);
+	}
+	return (0);
+}
+
 /* Log callback for libevent. */
 static void
 log_event_cb(__unused int severity, const char *msg)
@@ -125,12 +174,27 @@ log_vwrite(const char *msg, va_list ap, const char *prefix)
 void
 log_debug(const char *msg, ...)
 {
-	va_list	ap;
+	va_list	ap, ap2;
+	char	buf[1024];
 
 	if (log_file == NULL)
 		return;
 
 	va_start(ap, msg);
+
+	/*
+	 * Check drop list before the expensive vasprintf/stravis path.
+	 * log_should_drop initialises from TMUX_LOG_DROP on first call;
+	 * it returns 0 immediately when the list is empty.
+	 */
+	va_copy(ap2, ap);
+	vsnprintf(buf, sizeof buf, msg, ap2);
+	va_end(ap2);
+	if (log_should_drop(buf)) {
+		va_end(ap);
+		return;
+	}
+
 	log_vwrite(msg, ap, "");
 	va_end(ap);
 }
