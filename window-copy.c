@@ -4745,6 +4745,9 @@ window_copy_write_one(struct window_mode_entry *wme,
 	screen_write_cursormove(ctx, px, py, 0);
 	for (fx = 0; fx < nx; fx++) {
 		grid_get_cell(gd, fx, fy, &gc);
+		/* nicm tmux/tmux#5024: skip stray padding tails. */
+		if (gc.flags & GRID_FLAG_PADDING)
+			continue;
 		if (fx + gc.data.width <= nx) {
 			window_copy_update_style(wme, fx, fy, &gc, mgc, cgc,
 			    mkgc);
