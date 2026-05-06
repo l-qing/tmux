@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +56,27 @@ static const struct grid_cell grid_cleared_cell = {
 static const struct grid_cell_entry grid_cleared_entry = {
 	{ .data = { 0, 8, 8, ' ' } }, GRID_FLAG_CLEARED
 };
+
+/*
+ * Debug helper from nicm (tmux/tmux#4962): walk the grid and assert that no
+ * two lines share the same celldata or extddata pointer. A duplicate pointer
+ * means an earlier code path failed to clone a line and we have a stale alias
+ * that will eventually be double-freed or written through after free.
+ */
+void
+grid_check_lines(struct grid *gd)
+{
+	u_int	i, j;
+
+	for (i = 0; i < gd->hsize + gd->sy; i++) {
+		for (j = i + 1; j < gd->hsize + gd->sy; j++) {
+			if (gd->linedata[i].celldata != NULL)
+				assert(gd->linedata[i].celldata != gd->linedata[j].celldata);
+			if (gd->linedata[i].extddata != NULL)
+				assert(gd->linedata[i].extddata != gd->linedata[j].extddata);
+		}
+	}
+}
 
 /* Store cell in entry. */
 static void
@@ -284,10 +306,17 @@ grid_set_tab(struct grid_cell *gc, u_int width)
 static void
 grid_free_line(struct grid *gd, u_int py)
 {
-	free(gd->linedata[py].celldata);
-	gd->linedata[py].celldata = NULL;
-	free(gd->linedata[py].extddata);
-	gd->linedata[py].extddata = NULL;
+	struct grid_line	*gl = &gd->linedata[py];
+
+	/* nicm tmux/tmux#4962: catch corrupt line metadata before double-free. */
+	assert(gl->cellused <= gl->cellsize);
+	assert(gl->extdsize == 0 || gl->extddata != NULL);
+	assert(gl->cellsize == 0 || gl->celldata != NULL);
+
+	free(gl->celldata);
+	gl->celldata = NULL;
+	free(gl->extddata);
+	gl->extddata = NULL;
 }
 
 /* Free several lines. */
@@ -488,6 +517,8 @@ grid_scroll_history_region(struct grid *gd, u_int upper, u_int lower, u_int bg)
 	/* Move the history offset down over the line. */
 	gd->hscrolled++;
 	gd->hsize++;
+
+	grid_check_lines(gd);
 }
 
 /* Expand line to fit to cell. */
@@ -749,6 +780,8 @@ grid_move_lines(struct grid *gd, u_int dy, u_int py, u_int ny, u_int bg)
 	}
 	if (py != 0 && (py < dy || py >= dy + ny))
 		gd->linedata[py - 1].flags &= ~GRID_LINE_WRAPPED;
+
+	grid_check_lines(gd);
 }
 
 /* Move a group of cells. */
