@@ -33,6 +33,10 @@ static int	 log_level;
 static char	**log_drop_subs;
 static size_t	  log_drop_n;
 
+/* Substrings loaded from TMUX_LOG_KEEP (comma-separated) at first log call. */
+static char	**log_keep_subs;
+static size_t	  log_keep_n;
+
 /* Parse TMUX_LOG_DROP once; entries are comma-separated substrings. */
 static void
 log_init_drops(void)
@@ -73,6 +77,58 @@ log_should_drop(const char *buf)
 	}
 	for (i = 0; i < log_drop_n; i++) {
 		if (strstr(buf, log_drop_subs[i]) != NULL)
+			return (1);
+	}
+	return (0);
+}
+
+/* Parse TMUX_LOG_KEEP once; entries are comma-separated substrings. */
+static void
+log_init_keeps(void)
+{
+	const char	*env;
+	char		*copy, *p, *tok;
+	size_t		 cap = 0;
+
+	env = getenv("TMUX_LOG_KEEP");
+	if (env == NULL || *env == '\0')
+		return;
+	if ((copy = strdup(env)) == NULL)
+		return;
+	p = copy;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		if (*tok == '\0')
+			continue;
+		if (log_keep_n == cap) {
+			cap = (cap == 0) ? 16 : cap * 2;
+			log_keep_subs = xreallocarray(log_keep_subs, cap,
+			    sizeof *log_keep_subs);
+		}
+		log_keep_subs[log_keep_n++] = strdup(tok);
+	}
+	free(copy);
+}
+
+/*
+ * Return 1 if buf is allowed past the keep allowlist. When TMUX_LOG_KEEP is
+ * unset, everything passes (existing behaviour). When set, only buffers that
+ * match at least one substring pass — the rest are dropped before the drop
+ * blacklist runs.
+ */
+static int
+log_should_keep(const char *buf)
+{
+	static int	initialized;
+	size_t		i;
+
+	if (!initialized) {
+		initialized = 1;
+		log_init_keeps();
+	}
+	if (log_keep_n == 0)
+		return (1);
+	for (i = 0; i < log_keep_n; i++) {
+		if (strstr(buf, log_keep_subs[i]) != NULL)
 			return (1);
 	}
 	return (0);
@@ -190,7 +246,8 @@ log_debug(const char *msg, ...)
 	va_copy(ap2, ap);
 	vsnprintf(buf, sizeof buf, msg, ap2);
 	va_end(ap2);
-	if (log_should_drop(buf)) {
+	/* Allowlist runs first, then blacklist; both are no-op when unset. */
+	if (!log_should_keep(buf) || log_should_drop(buf)) {
 		va_end(ap);
 		return;
 	}
