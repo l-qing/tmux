@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "tmux.h"
@@ -225,6 +226,23 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	len = 0;
 	width = 0;
 	current_state = TTY_DRAW_LINE_FIRST;
+
+	/*
+	 * Sanity guard for tmux/tmux#5024 follow-up: pad.diff.txt fixes the
+	 * i-stuck-on-PADDING-width=0 livelock, but a separate path was observed
+	 * (2026-05-09) where i advances correctly yet nx is itself an enormous
+	 * unsigned (likely an underflow into ~UINT_MAX from tty->sx - atx,
+	 * nx - cx, or a caller-side computation), making i == nx unreachable.
+	 * Abort early with caller context so the next reproduction lands in a
+	 * .ips report instead of a multi-GB verbose log spiral.
+	 */
+	if (nx > 100000) {
+		log_debug("%s: SUSPICIOUS nx=%u px=%u py=%u atx=%u aty=%u "
+		    "ex=%u sx=%u sy=%u", __func__, nx, px, py, atx, aty,
+		    ex, tty->sx, tty->sy);
+		abort();
+	}
+
 	for (;;) {
 		/* Work out the next state. */
 		if (i == nx) {
