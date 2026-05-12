@@ -32,10 +32,12 @@ static int	 log_level;
 /* Substrings loaded from TMUX_LOG_DROP (comma-separated) at first log call. */
 static char	**log_drop_subs;
 static size_t	  log_drop_n;
+static int	  log_drop_initialized;
 
 /* Substrings loaded from TMUX_LOG_KEEP (comma-separated) at first log call. */
 static char	**log_keep_subs;
 static size_t	  log_keep_n;
+static int	  log_keep_initialized;
 
 /* Parse TMUX_LOG_DROP once; entries are comma-separated substrings. */
 static void
@@ -64,20 +66,92 @@ log_init_drops(void)
 	free(copy);
 }
 
+/* Run log_init_drops() exactly once, regardless of caller. */
+static void
+log_ensure_drops(void)
+{
+	if (log_drop_initialized)
+		return;
+	log_drop_initialized = 1;
+	log_init_drops();
+}
+
 /* Return 1 if buf matches any entry in the drop list. */
 static int
 log_should_drop(const char *buf)
 {
-	static int	initialized;
-	size_t		i;
+	size_t	i;
 
-	if (!initialized) {
-		initialized = 1;
-		log_init_drops();
-	}
+	log_ensure_drops();
 	for (i = 0; i < log_drop_n; i++) {
 		if (strstr(buf, log_drop_subs[i]) != NULL)
 			return (1);
+	}
+	return (0);
+}
+
+/*
+ * Fast-path drop check against __func__ only — avoids the vsnprintf cost
+ * incurred by log_should_drop, which has to operate on the rendered buffer
+ * because some patterns ("peer 0x", "file ", "wcwidth(", ...) only appear in
+ * the message body. Drop entries whose leading identifier is followed by
+ * '\0', ':' or ' ' represent function-name prefixes; for those we can match
+ * directly on __func__ and short-circuit before any formatting work happens.
+ * Entries that continue with other characters (e.g. "wcwidth(", "peer 0x")
+ * fall through and are handled by the slow path. Drop always takes precedence
+ * over keep, so a positive fast-path drop is unconditionally correct even
+ * when TMUX_LOG_KEEP is in effect.
+ */
+static int
+log_func_should_drop(const char *func)
+{
+	size_t		 i, n;
+	const char	*sub;
+	char		 tail;
+	char		 ident[64];
+
+	log_ensure_drops();
+	if (log_drop_n == 0 || func == NULL)
+		return (0);
+	for (i = 0; i < log_drop_n; i++) {
+		sub = log_drop_subs[i];
+		/* Length of the leading [A-Za-z0-9_] identifier in sub. */
+		for (n = 0; sub[n] != '\0'; n++) {
+			if (!isalnum((unsigned char)sub[n]) && sub[n] != '_')
+				break;
+		}
+		if (n == 0)
+			continue;
+		tail = sub[n];
+		/*
+		 * Fast path only handles entries shaped like a function name
+		 * followed by an end-of-name terminator. ':' is the standard
+		 * "%s: ..." log_debug prefix; ' ' covers the few callers that
+		 * emit "<func> ..." without a colon (e.g. status_redraw);
+		 * '\0' covers bare-prefix entries like "format_loop" that
+		 * intentionally match a family of related functions via
+		 * strstr.
+		 */
+		if (tail != '\0' && tail != ':' && tail != ' ')
+			continue;
+		if (strstr(func, sub) != NULL) {
+			/* Full substring (including the terminator) is in
+			 * func — unlikely for ':' / ' ' tails but harmless. */
+			return (1);
+		}
+		if (tail != '\0' && n < sizeof ident) {
+			/*
+			 * The full sub (with trailing ':' or ' ') doesn't
+			 * occur in func because __func__ never carries those
+			 * separators. Retry matching just the identifier
+			 * prefix against func — strstr so bare prefixes like
+			 * "cmd_find_" match cmd_find_pane.
+			 */
+			memcpy(ident, sub, n);
+			ident[n] = '\0';
+			if (strstr(func, ident) != NULL)
+				return (1);
+		}
 	}
 	return (0);
 }
@@ -109,6 +183,16 @@ log_init_keeps(void)
 	free(copy);
 }
 
+/* Run log_init_keeps() exactly once, regardless of caller. */
+static void
+log_ensure_keeps(void)
+{
+	if (log_keep_initialized)
+		return;
+	log_keep_initialized = 1;
+	log_init_keeps();
+}
+
 /*
  * Return 1 if buf is allowed past the keep allowlist. When TMUX_LOG_KEEP is
  * unset, everything passes (existing behaviour). When set, only buffers that
@@ -118,13 +202,9 @@ log_init_keeps(void)
 static int
 log_should_keep(const char *buf)
 {
-	static int	initialized;
-	size_t		i;
+	size_t	i;
 
-	if (!initialized) {
-		initialized = 1;
-		log_init_keeps();
-	}
+	log_ensure_keeps();
 	if (log_keep_n == 0)
 		return (1);
 	for (i = 0; i < log_keep_n; i++) {
@@ -226,9 +306,19 @@ log_vwrite(const char *msg, va_list ap, const char *prefix)
 	free(out);
 }
 
-/* Log a debug message. */
+/*
+ * Log a debug message.
+ *
+ * Invoked as the macro log_debug(...) from tmux.h, which expands to
+ * log_debug_func(__func__, ...). The __func__ string lets us short-circuit
+ * the dispatcher with log_func_should_drop before paying for any vsnprintf
+ * formatting — the dominant cost on hot paths under -v. Entries that the
+ * fast path cannot resolve (because the substring is in the rendered body
+ * rather than the function name) fall through to the original vsnprintf +
+ * buffer-based check.
+ */
 void
-log_debug(const char *msg, ...)
+log_debug_func(const char *func, const char *msg, ...)
 {
 	va_list	ap, ap2;
 	char	buf[1024];
@@ -236,12 +326,16 @@ log_debug(const char *msg, ...)
 	if (log_file == NULL)
 		return;
 
+	/* Fast path: __func__-based drop. No formatting performed. */
+	if (log_func_should_drop(func))
+		return;
+
 	va_start(ap, msg);
 
 	/*
-	 * Check drop list before the expensive vasprintf/stravis path.
-	 * log_should_drop initialises from TMUX_LOG_DROP on first call;
-	 * it returns 0 immediately when the list is empty.
+	 * Slow path: format once into buf so the keep allowlist and the
+	 * non-function-name drop patterns (e.g. "peer 0x", "file ",
+	 * "wcwidth(") can be evaluated against the rendered message.
 	 */
 	va_copy(ap2, ap);
 	vsnprintf(buf, sizeof buf, msg, ap2);
