@@ -3717,7 +3717,14 @@ int	log_get_level(void);
 void	log_open(const char *);
 void	log_toggle(const char *);
 void	log_close(void);
-void printflike(1, 2) log_debug(const char *, ...);
+/*
+ * log_debug() is a macro that injects __func__ so the dispatcher can run a
+ * fast-path drop check against the function name without paying for
+ * vsnprintf when the line is going to be filtered. See log_debug_func and
+ * log_func_should_drop in log.c for the details.
+ */
+void printflike(2, 3) log_debug_func(const char *, const char *, ...);
+#define log_debug(...) log_debug_func(__func__, __VA_ARGS__)
 __dead void printflike(1, 2) fatal(const char *, ...);
 __dead void printflike(1, 2) fatalx(const char *, ...);
 
