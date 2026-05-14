@@ -1502,11 +1502,8 @@ server_client_loop(void)
 
 	/* Send theme updates. */
 	RB_FOREACH(w, windows, &windows) {
-		TAILQ_FOREACH(wp, &w->panes, entry) {
+		TAILQ_FOREACH(wp, &w->panes, entry)
 			window_pane_send_theme_update(wp);
-			/* nicm tmux/tmux#4962 stale-pointer guard. */
-			grid_check_lines(wp->base.grid);
-		}
 	}
 }
 

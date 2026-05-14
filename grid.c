@@ -62,11 +62,21 @@ static const struct grid_cell_entry grid_cleared_entry = {
  * two lines share the same celldata or extddata pointer. A duplicate pointer
  * means an earlier code path failed to clone a line and we have a stale alias
  * that will eventually be double-freed or written through after free.
+ *
+ * The walk is O((hsize+sy)^2). With a typical history-limit it costs millions
+ * of pointer compares per call and lights up vi/scroll-heavy workloads, so it
+ * is gated behind TMUX_DEBUG_4962 — opt in only when actively chasing #4962.
  */
 void
 grid_check_lines(struct grid *gd)
 {
-	u_int	i, j;
+	static int	debug_4962 = -1;
+	u_int		i, j;
+
+	if (debug_4962 == -1)
+		debug_4962 = (getenv("TMUX_DEBUG_4962") != NULL);
+	if (!debug_4962)
+		return;
 
 	for (i = 0; i < gd->hsize + gd->sy; i++) {
 		for (j = i + 1; j < gd->hsize + gd->sy; j++) {
